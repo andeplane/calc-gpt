@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>calc-gpt — a language model that learns to add, live in your browser</title>
+  <meta name="description" content="Train a tiny GPT on the language of arithmetic, from scratch, in your tab. Then teach the same model subtraction without starting over." />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" />
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"
+    onload="renderMathInElement(document.body, {delimiters: [
+      {left: '\\[', right: '\\]', display: true},
+      {left: '\\(', right: '\\)', display: false}
+    ]});"></script>
+</head>
+<body>
+<article>
+  <h1>calc-gpt</h1>
+  <p class="subtitle">A language model that learns to add — trained from scratch, live, in
+  this tab. Then we teach the <em>same</em> model subtraction, without starting over.</p>
+
+  <p>Language models feel magical partly because natural language is messy. So let's
+  strip the magic to its skeleton: a language with sixteen characters, where every
+  sentence looks like <code>23+45=68;</code>. It has grammar (digits, then an operator,
+  then <code>=</code>), it has meaning (the part after <code>=</code> is <em>entailed</em>
+  by the part before), and we can generate unlimited perfect training data with two
+  random numbers and a plus sign.</p>
+
+  <p>Everything below runs in your browser: a two-layer GPT with about 27,000
+  parameters, written from scratch in TypeScript — embeddings, causal self-attention,
+  the backward pass, Adam — no ML library, no autograd, no server. The full source with
+  100% test coverage is on <a href="https://github.com/andeplane/calc-gpt">GitHub</a>.</p>
+
+  <h2>1 · The language</h2>
+  <p>A training document is one problem followed by its answer and a terminator:</p>
+  <pre><code>23+45=68;
+7+80=87;
+99+99=198;</code></pre>
+  <p>Operands go up to two digits, so answers reach three digits. The model's only job —
+  like every GPT — is <strong>next-token prediction</strong>: given the characters so far,
+  guess the next one. When the characters so far are <code>23+45=</code>, guessing the
+  next one <em>is</em> arithmetic.</p>
+
+  <h2>2 · The tokenizer</h2>
+  <p>Real models use subword tokenizers with tens of thousands of entries. Ours is a
+  16-character alphabet — each character is one token, its id is its position:</p>
+  <pre><code>0 1 2 3 4 5 6 7 8 9 + - * / = ;</code></pre>
+  <p>Notice something sneaky: the vocabulary already contains <code>-</code>,
+  <code>*</code> and <code>/</code>, even though phase 1 trains <em>only</em> on
+  addition. Those embedding rows will sit there, randomly initialized and never updated
+  — words the model has never heard. That reserved space is what lets us teach
+  subtraction later <strong>without changing the model at all</strong>.</p>
+
+  <div class="panel">
+    <h3>Try it</h3>
+    <p class="muted" style="font-size:14px">Type any expression — each chip shows a character and its token id.</p>
+    <input id="tok-input" type="text" value="23+45=68;" spellcheck="false" style="width:100%" />
+    <div id="tok-output" class="tok-row"></div>
+  </div>
+
+  <h2>3 · The model</h2>
+  <p>A sequence of tokens \(x_1, \dots, x_T\) enters as vectors: each token id looks up
+  a learned <em>token embedding</em>, and each position adds a learned <em>position
+  embedding</em>:</p>
+  \[ h^{(0)}_t = E_{x_t} + P_t \qquad E \in \mathbb{R}^{16 \times 48},\; P \in \mathbb{R}^{12 \times 48} \]
+  <p>Then come two transformer blocks. Each block first lets positions look at each
+  other (attention), then thinks about what it saw (a small MLP), with residual
+  connections and layer norms around both:</p>
+  \[ q_i = \mathrm{LN}(h_i) W_Q, \quad k_i = \mathrm{LN}(h_i) W_K, \quad v_i = \mathrm{LN}(h_i) W_V \]
+  \[ A_{ij} = \operatorname*{softmax}_{j \,\le\, i} \left( \frac{q_i \cdot k_j}{\sqrt{d_h}} \right), \qquad o_i = \sum_{j \le i} A_{ij} \, v_j \]
+  <p>The constraint \(j \le i\) is the <strong>causal mask</strong> — position \(i\) may
+  only attend to the past, which is what makes generation possible. With 4 heads of
+  dimension \(d_h = 12\), the heads run in parallel and are concatenated back to 48
+  dimensions. The MLP is two linear layers with a ReLU:</p>
+  \[ h' = h + W_O\,[o^{1} \dots o^{4}], \qquad h'' = h' + W_2 \max(0,\, W_1\, \mathrm{LN}(h') + b_1) + b_2 \]
+  <p>A final layer norm and a linear head produce 16 numbers per position — the
+  <em>logits</em> \(z\), one score per character in the vocabulary.</p>
+
+  <h2>4 · The loss — grade only the answer</h2>
+  <p>Softmax turns logits into a probability distribution, and we penalize the negative
+  log-probability of the true next character:</p>
+  \[ p = \mathrm{softmax}(z), \qquad \mathcal{L} = -\frac{1}{|M|} \sum_{t \in M} \log p_t[y_t] \]
+  <p>The set \(M\) matters: we only grade positions whose target lies <strong>after the
+  <code>=</code></strong>. The question is random noise — there is nothing to learn about
+  whether the next problem is <code>23+45</code> or <code>7+80</code> — so the model is
+  graded purely on computing the answer (including the closing <code>;</code>, which
+  makes it learn when to <em>stop</em>).</p>
+
+  <h2>5 · The backward pass, by hand</h2>
+  <p>There is no autograd here — every gradient is derived and coded manually, exactly
+  like <a href="https://karpathy.github.io/2026/02/12/microgpt/">microgpt</a>. The
+  seed of the whole thing is the famous softmax + cross-entropy gradient, which
+  collapses to something almost embarrassingly simple:</p>
+  \[ \frac{\partial \mathcal{L}}{\partial z_v} = p_v - \mathbb{1}[v = y] \]
+  <p>The predicted distribution minus a one-hot of the truth. From there the chain rule
+  walks backwards through everything — the head, the layer norms
+  (\(\hat{x}\)-centered form), the ReLU gate, and attention, where the softmax Jacobian
+  gives</p>
+  \[ \frac{\partial \mathcal{L}}{\partial s_{ij}} = A_{ij}\left(g_{ij} - \textstyle\sum_k g_{ik} A_{ik}\right), \qquad g_{ij} = \frac{\partial \mathcal{L}}{\partial A_{ij}} \]
+  <p>Deriving this is fun exactly once, and then you want a machine to check it forever:
+  the test suite perturbs every weight tensor and compares
+  \(\big(\mathcal{L}(w+\varepsilon) - \mathcal{L}(w-\varepsilon)\big)/2\varepsilon\)
+  against the analytic gradients. If any equation above were coded wrong, CI would go red.</p>
+
+  <h2>6 · The update — Adam</h2>
+  <p>Each step samples a fresh batch of 32 problems (the dataset is infinite — no
+  epochs, no repeats), computes gradients, and updates every parameter with Adam:</p>
+  \[ m \leftarrow \beta_1 m + (1{-}\beta_1) g, \qquad v \leftarrow \beta_2 v + (1{-}\beta_2) g^2 \]
+  \[ w \leftarrow w - \eta\, \frac{\hat{m}}{\sqrt{\hat{v}} + \epsilon}, \qquad \hat{m} = \frac{m}{1-\beta_1^t},\; \hat{v} = \frac{v}{1-\beta_2^t} \]
+  <p>Momentum smooths the direction; the second moment gives every parameter its own
+  step size. That's the whole training loop.</p>
+
+  <h2>7 · Watch it learn addition</h2>
+  <p>This is the real model training in a web worker in your tab — not a recording. The
+  loss starts near \(\ln 16 \approx 2.77\) (uniform guessing over 16 characters) and
+  falls as the model discovers digits, then place value, then carrying. Accuracy is
+  exact-match on held-out problems it has never seen.</p>
+
+  <div class="panel panel-wide">
+    <div class="controls">
+      <button id="btn-start" disabled>Start training</button>
+      <span id="train-status" class="status">loading model…</span>
+    </div>
+    <h3>Training loss <span class="muted" style="font-weight:400;font-size:13px">(log scale)</span></h3>
+    <div id="loss-chart"></div>
+    <h3>Held-out accuracy</h3>
+    <div id="acc-chart"></div>
+    <div id="acc-legend" class="legend"></div>
+    <div id="train-samples" class="samples"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Ask the model</h3>
+    <p class="muted" style="font-size:14px">Query the live weights at any point — mid-training answers are part of the fun.</p>
+    <div class="controls">
+      <input id="ask-input" type="text" placeholder="e.g. 23+45" spellcheck="false" />
+      <button id="ask-btn">Ask</button>
+    </div>
+    <div id="ask-result" class="answer-line"></div>
+  </div>
+
+  <h2>8 · Phase 2 — teach the same model subtraction</h2>
+  <p>Here is the payoff of the reserved token. Click the button and the data mix
+  changes to 50% addition, 50% subtraction — <strong>nothing else changes</strong>. Same
+  weights, same optimizer state, same tokenizer. The <code>-</code> embedding, random
+  since initialization, starts receiving gradients for the first time.</p>
+  <p>Watch the charts: loss jumps (subtraction is gibberish to the model at first),
+  addition accuracy may dip briefly while capacity reorganizes, and a new subtraction
+  curve climbs from zero. Note what subtraction demands that addition never did: the
+  model must output <code>-</code> as the <em>first character</em> of an answer like
+  <code>3-47=-44;</code> — the same token doing double duty as operator and sign.</p>
+
+  <div class="panel">
+    <div class="controls">
+      <button id="btn-phase2" class="secondary">Add subtraction to the data</button>
+    </div>
+    <p id="phase2-note" class="muted hidden" style="font-size:14px">
+      The dashed line on the charts above marks the moment the curriculum changed.</p>
+  </div>
+
+  <h2>9 · Why this is built the way it is</h2>
+  <ul>
+    <li><strong>Everything is injected.</strong> The trainer receives its model,
+    optimizer, data generator and metrics sink as constructor arguments. A curriculum
+    phase is literally <code>trainer.setGenerator(mixed)</code> — and in tests, every
+    collaborator can be a stub.</li>
+    <li><strong>100% test coverage, enforced.</strong> Statements, branches, functions
+    and lines, gated in CI. The pillar is the gradient check: numerical differentiation
+    vs. the hand-written backward pass, for every parameter tensor.</li>
+    <li><strong>No dependencies at runtime.</strong> The engine is plain TypeScript on
+    <code>Float32Array</code>s. The page you're reading, its charts, and the training
+    loop are the whole stack.</li>
+  </ul>
+
+  <details>
+    <summary>The same model in numpy</summary>
+    <p>If Python is more your language, <a
+    href="https://github.com/andeplane/calc-gpt/blob/main/python/calc_gpt_micro.py">
+    <code>python/calc_gpt_micro.py</code></a> is a line-for-line equivalent of the
+    engine — same architecture, same manual backward pass, same training loop, in
+    ~200 lines of numpy.</p>
+  </details>
+
+  <h2>10 · Where this goes</h2>
+  <p>The obvious next steps are the rest of the vocabulary: <code>*</code> and
+  <code>/</code> are still sitting there, reserved and untrained. Multiplication is
+  genuinely harder — carrying interacts across every digit pair — and at some point
+  this 27k-parameter model runs out of capacity. That question, <em>how much model do
+  you need for how much arithmetic</em>, has a satisfying empirical answer: train the
+  same architecture at a ladder of sizes and watch accuracy climb with parameter count.
+  But that's a bigger GPU-shaped experiment for another post.</p>
+
+  <footer>
+    <p>Built with a hand-rolled transformer in TypeScript. Inspired by
+    <a href="https://karpathy.github.io/2026/02/12/microgpt/">Karpathy's microgpt</a>.
+    Source: <a href="https://github.com/andeplane/calc-gpt">github.com/andeplane/calc-gpt</a>.</p>
+  </footer>
+</article>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
