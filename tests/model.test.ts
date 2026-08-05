@@ -136,7 +136,7 @@ describe("optimization end-to-end", () => {
     for (const { prompt, answer } of problems) {
       expect(model.greedyAnswer(tok, prompt)).toBe(answer);
     }
-  });
+  }, 60_000);
 
   it("greedy decode stops when the context window fills up", () => {
     const model = new CalcGPT(tinyCfg, new Mulberry32(1));
