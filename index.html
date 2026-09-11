@@ -59,22 +59,236 @@
   </div>
 
   <h2>3 · The model</h2>
-  <p>A sequence of tokens \(x_1, \dots, x_T\) enters as vectors: each token id looks up
-  a learned <em>token embedding</em>, and each position adds a learned <em>position
-  embedding</em>:</p>
-  \[ h^{(0)}_t = E_{x_t} + P_t \qquad E \in \mathbb{R}^{16 \times 48},\; P \in \mathbb{R}^{12 \times 48} \]
-  <p>Then come two transformer blocks. Each block first lets positions look at each
-  other (attention), then thinks about what it saw (a small MLP), with residual
-  connections and layer norms around both:</p>
-  \[ q_i = \mathrm{LN}(h_i) W_Q, \quad k_i = \mathrm{LN}(h_i) W_K, \quad v_i = \mathrm{LN}(h_i) W_V \]
-  \[ A_{ij} = \operatorname*{softmax}_{j \,\le\, i} \left( \frac{q_i \cdot k_j}{\sqrt{d_h}} \right), \qquad o_i = \sum_{j \le i} A_{ij} \, v_j \]
-  <p>The constraint \(j \le i\) is the <strong>causal mask</strong> — position \(i\) may
-  only attend to the past, which is what makes generation possible. With 4 heads of
-  dimension \(d_h = 12\), the heads run in parallel and are concatenated back to 48
-  dimensions. The MLP is two linear layers with a ReLU:</p>
-  \[ h' = h + W_O\,[o^{1} \dots o^{4}], \qquad h'' = h' + W_2 \max(0,\, W_1\, \mathrm{LN}(h') + b_1) + b_2 \]
-  <p>A final layer norm and a linear head produce 16 numbers per position — the
-  <em>logits</em> \(z\), one score per character in the vocabulary.</p>
+  <p>Let's follow <code>23+45=</code> through the model as it tries to predict
+  <code>6</code>, the first character of the answer. We will keep track of what the
+  numbers represent at every step. No knowledge of neural networks is needed.</p>
+
+  <h3>From characters to IDs to lists of numbers</h3>
+  <p>The tokenizer gives each character a number from the vocabulary above, counting
+  from zero. This number is its <strong>token ID</strong>: an address in a table.
+  The ID for <code>+</code> is 10 and the ID for <code>=</code> is 14.</p>
+  <pre><code>characters:    2   3   +   4   5   =
+token IDs:     2   3  10   4   5  14
+positions:     0   1   2   3   4   5</code></pre>
+  <p>Don't confuse those last two rows. The token ID says <em>which character</em>;
+  the position says <em>where it occurs in this input</em>. ID 10 does not mean that
+  <code>+</code> has a numerical value of ten. IDs are labels, even when the character
+  itself happens to be a digit.</p>
+
+  <p>A <strong>vector</strong> here is simply an ordered list of numbers, such as
+  <code>[0.20, -0.10, 0.40, 0.00]</code>. Each entry is one component; this example
+  has four components, so we call it a four-dimensional vector. You do not need to
+  picture a four-dimensional space: it is an array that the program can multiply
+  and add. The real model uses <strong>32 numbers per token</strong>.</p>
+
+  <h3>A token embedding is a row in a table</h3>
+  <p>The model stores a table called <code>E</code>, with 16 rows (one per possible
+  token) and 32 columns. To turn a token into a vector, it uses the token ID to
+  retrieve that row. This lookup is called a <strong>token embedding</strong>.
+  An embedding is the numeric representation that the rest of the model works on.</p>
+  <pre><code>// Illustrative values, showing only 4 of the 32 components:
+E[2]  = [ 0.20, -0.10,  0.40,  0.00, … ]  // character "2"
+E[3]  = [-0.30,  0.20,  0.10,  0.50, … ]  // character "3"
+E[10] = [ 0.10,  0.60, -0.20,  0.30, … ]  // character "+"
+
+// Looking up six IDs gives six vectors, not one vector:
+[2, 3, 10, 4, 5, 14] → [E[2], E[3], E[10], E[4], E[5], E[14]]</code></pre>
+  <p>That is what “tokens enter as vectors” means: six IDs become six rows of 32
+  numbers, a <strong>6 × 32 array</strong>. Every occurrence of <code>2</code> starts
+  with the same token vector. Later operations will change it according to context.</p>
+
+  <p>Why a whole list instead of just the ID? The list gives the model many adjustable
+  numbers with which to represent useful distinctions between tokens. We do not
+  assign a column to “is a digit” or “causes a carry.” Individual columns need not
+  have a simple human meaning; useful information can be spread across them.</p>
+  <p><strong>Learned</strong> means those table entries are changed by training.
+  Initially they are small random numbers. For a problem such as <code>23+45=68;</code>,
+  the model predicts the answer, measures its error, and calculates how changes to
+  its parameters would affect that error. A parameter is just an adjustable number,
+  including an embedding entry. Repeated small updates make the representations
+  more useful for predicting answers. During an ordinary prediction, the tables are
+  only read; they are not relearned for each prompt.</p>
+
+  <h3>A position embedding tells the model where a token is</h3>
+  <p>Consider <code>22+3=</code>. Both <code>2</code>s retrieve <code>E[2]</code>,
+  although the first is in the tens place and the second in the ones place.
+  Token identity alone does not distinguish those occurrences. We give the model
+  an explicit signal for their locations using another table, <code>P</code>.</p>
+  <p><code>P</code> has 12 rows, one for each input position this model supports,
+  and 32 numbers per row. <code>P[0]</code> is the <strong>position embedding</strong>
+  for the first slot; <code>P[1]</code> is for the second. These rows also start
+  random and are adjusted during training. They represent absolute slots, not
+  hand-written rules for tens and ones: the model must learn how a slot relates to
+  place value from the surrounding expression.</p>
+  <p>At each position we <strong>add the two vectors component by component</strong>.
+  We do not append the position number, and we do not join the two lists into a
+  longer list. Here is a complete four-component toy example:</p>
+  <pre><code>token vector for "2":  [ 0.20, -0.10,  0.40,  0.00 ]
+position vector P[0]:  [ 0.01,  0.03, -0.02,  0.05 ]
+                       ---------------------------
+first "2" starts as:   [ 0.21, -0.07,  0.38,  0.05 ]
+
+same token vector:     [ 0.20, -0.10,  0.40,  0.00 ]
+position vector P[1]:  [-0.04,  0.02,  0.01, -0.03 ]
+                       ---------------------------
+second "2" starts as:  [ 0.16, -0.08,  0.41, -0.03 ]</code></pre>
+  <p>Same character, different starting vectors. The real addition works exactly
+  this way across all 32 components. For our original <code>23+45=</code> input,
+  the array still has six rows and 32 columns.</p>
+  <details>
+    <summary>The embedding equation, with every symbol explained</summary>
+    \[ h^{(0)}_t = E_{x_t} + P_t \]
+    <p>We count positions from zero, as the code does. \(t\) is the position,
+    \(x_t\) is the token ID there, \(E_{x_t}\) is its token-table row, and
+    \(P_t\) is its position-table row. \(h^{(0)}_t\) names their sum: the
+    starting vector at that position. The superscript \((0)\) labels the starting
+    stage, not a power. In array notation: <code>h[t][c] = E[ids[t]][c] + P[t][c]</code>,
+    for each component <code>c</code> from 0 to 31.</p>
+  </details>
+
+  <h3>What is a transformer block?</h3>
+  <p>A <strong>transformer block</strong> is a sequence of calculations that updates
+  those vectors. It takes one vector per position and returns one updated vector
+  per position, with the same number of components. It has two main operations:
+  <strong>attention</strong> mixes information from different positions, and a
+  <strong>feed-forward network</strong> transforms the numbers at each position.
+  We will unpack both below.</p>
+  <p>This model runs two such blocks in sequence, each with its own learned
+  parameters. The second works on the first block's updated vectors. “Two blocks”
+  means two rounds of processing, not two generated characters.</p>
+  <div class="panel" aria-label="The path from input to next-token scores">
+    <strong>Follow the six positions in <code>23+45=</code></strong>
+    <ol>
+      <li>Look up token vectors and add position vectors: <strong>6 × 32 numbers</strong>.</li>
+      <li>Block 1 mixes and transforms them: <strong>6 × 32 numbers</strong>.</li>
+      <li>Block 2 mixes and transforms them again: <strong>6 × 32 numbers</strong>.</li>
+      <li>Convert each vector into scores for the 16 possible next characters:
+      <strong>6 × 16 numbers</strong>.</li>
+      <li>Use the scores at the final position, <code>=</code>, to choose the next character.</li>
+    </ol>
+  </div>
+
+  <h3>Attention: mix information from the available positions</h3>
+  <p>At the <code>=</code> position, predicting <code>6</code> requires information
+  about the preceding digits and operator. <strong>Self-attention</strong> lets that
+  position receive information from other positions in the same input. It computes
+  a weight for each available position, then mixes their numeric information using
+  those weights.</p>
+  <p>To calculate this, the block makes three new vectors from each position's
+  current vector using learned weighted sums. They are called:</p>
+  <ul>
+    <li><strong>Query:</strong> numbers used to score potential sources of information.</li>
+    <li><strong>Key:</strong> numbers that each source provides for that comparison.</li>
+    <li><strong>Value:</strong> the information from that source that will actually be mixed.</li>
+  </ul>
+  <p>A query and key are compared by multiplying matching components and adding
+  the products, a <strong>dot product</strong>. For example,
+  <code>[1, 2] · [3, 4] = 1×3 + 2×4 = 11</code>. The model scales these scores,
+  then applies <strong>softmax</strong>: exponentiate each score and divide by the
+  sum of all the exponentials. This gives positive weights that add to one;
+  higher scores get more weight.</p>
+  <pre><code>// Illustrative attention weights at "=", not measured weights:
+source:     2     3     +     4     5     =
+weight:   0.10  0.20  0.05  0.15  0.40  0.10
+
+mixture = 0.10 × value at "2" + 0.20 × value at "3"
+        + 0.05 × value at "+" + 0.15 × value at "4"
+        + 0.40 × value at "5" + 0.10 × value at "="</code></pre>
+  <p>Each multiplication scales a whole value vector; adding them produces one
+  mixed vector. If one component of those six value vectors were
+  <code>[1, 2, 0, 4, 3, 0]</code>, that component of the mixture would be
+  <code>0.10×1 + 0.20×2 + 0.05×0 + 0.15×4 + 0.40×3 + 0.10×0 = 2.30</code>.
+  These are internal features, not the digits being added. Attention does not
+  directly execute <code>23 + 45</code>.</p>
+
+  <p>There is one restriction: a position can use <strong>itself and earlier
+  positions, never later ones</strong>. This is the <strong>causal mask</strong>.
+  At <code>+</code>, only <code>23+</code> is available; at <code>=</code>, all of
+  <code>23+45=</code> is available. Even when training on the complete
+  <code>23+45=68;</code>, the vector at <code>=</code> cannot peek at the
+  <code>6</code> it is supposed to predict. Forbidden positions get zero weight.</p>
+  <p>The model performs four separate attention mixtures in parallel. These are
+  its four <strong>attention heads</strong>, each using query, key, and value vectors
+  with eight components. Each head has its own learned comparisons, so they can
+  weight different sources. We do not prescribe jobs such as “find the ones digit.”
+  Their four eight-number results are joined into 32 numbers, then a learned
+  weighted-sum operation mixes those components together.</p>
+
+  <h3>The feed-forward network: transform each position's vector</h3>
+  <p>After attention, each position has information from its available context.
+  A small <strong>feed-forward network</strong>, also called a
+  <strong>multilayer perceptron (MLP)</strong>, processes that position's vector.
+  The same calculation, with the same learned parameters, is applied separately
+  to every position. This operation does not read other positions directly.</p>
+  <ol>
+    <li><strong>Expand 32 numbers to 128.</strong> Each new number is a learned
+    weighted sum of the inputs plus a learned offset, called a <em>bias</em>.
+    One toy output could be <code>2×a − 0.5×b + 0.1</code>, where
+    <code>a</code> and <code>b</code> are input components. This is what the page
+    means by a “linear layer.”</li>
+    <li><strong>Replace negative results with zero.</strong> This operation is
+    called <em>ReLU</em>: <code>[-0.8, 0.3, 1.2] → [0, 0.3, 1.2]</code>.
+    The cutoff lets the network respond differently to different combinations of
+    inputs; without it, two successive linear layers could be collapsed into one.</li>
+    <li><strong>Map 128 numbers back to 32</strong> with another set of learned
+    weighted sums and biases. These numbers form an update to the position's vector.</li>
+  </ol>
+
+  <h3>Two supporting operations: normalization and addition</h3>
+  <p><strong>Layer normalization</strong> adjusts the scale of a vector before
+  attention and before the MLP. At each position separately, it subtracts the mean
+  of the 32 components and divides by their standard deviation, with a small
+  stabilizing constant. It then applies a learned scale and offset to each
+  component. For example, <code>[2, 4]</code> has mean 3 and standard deviation 1,
+  so its normalized values are approximately <code>[-1, 1]</code> before the
+  learned scale and offset. This helps keep the inputs to the calculations well scaled.</p>
+  <p>A <strong>residual connection</strong> means adding an operation's output to
+  the vector it started with, component by component. If a vector were
+  <code>[0.2, 0.5]</code> and attention produced an update of
+  <code>[0.1, -0.2]</code>, their sum would be <code>[0.3, 0.3]</code>.
+  Each operation can therefore learn an adjustment while retaining a direct path
+  for the previous information.</p>
+  <pre><code>// One block; h holds one 32-number vector per position.
+// Layer normalization is applied to each row separately.
+h = h + attention(layerNorm(h))
+h = h + mlp(layerNorm(h))
+// Repeat with the second block's own learned parameters.</code></pre>
+
+  <details>
+    <summary>Connect the attention calculations to the equations</summary>
+    <p>For one head, let \(u_i = \mathrm{LN}(h_i)\) be the normalized vector
+    at position \(i\). Each \(W\) is a learned table of multiplication weights;
+    each \(b\) is a learned bias vector. We write vectors as rows:</p>
+    \[ q_i = u_i W_Q + b_Q, \quad k_i = u_i W_K + b_K, \quad v_i = u_i W_V + b_V \]
+    \[ s_{ij} = \frac{q_i \cdot k_j}{\sqrt{8}}, \qquad A_{ij} = \frac{e^{s_{ij}}}{\sum_{r=0}^{i} e^{s_{ir}}} \quad (j \le i) \]
+    <p>\(s_{ij}\) is the comparison score from destination \(i\) to source
+    \(j\). Dividing by \(\sqrt{8}\) moderates the score's scale for an
+    eight-component head. \(A_{ij}\) is its softmax weight; it is zero for
+    \(j &gt; i\). The mixed value vector is:</p>
+    \[ o_i = \sum_{j=0}^{i} A_{ij}v_j \]
+    <p>Joining the four heads' outputs (the brackets below) and applying the output
+    weights gives the attention update. A prime labels an updated vector:</p>
+    \[ h'_i = h_i + [o_i^1\; o_i^2\; o_i^3\; o_i^4]W_O + b_O \]
+    \[ h''_i = h'_i + \max(0,\, \mathrm{LN}(h'_i)W_1 + b_1)W_2 + b_2 \]
+    <p>The last equation is the 32 → 128 → 32 MLP and its residual addition.
+    The maximum is taken separately for every component: that is ReLU.</p>
+  </details>
+
+  <h3>Turn the final vector into a next-character prediction</h3>
+  <p>After both blocks, a final layer normalization and a learned table of weights
+  turn each 32-number vector into <strong>16 scores</strong>, one per vocabulary
+  token. These scores are called <strong>logits</strong>. They are not probabilities:
+  they can be negative and do not have to add to one. Softmax converts them to
+  probabilities, which the next section uses to grade the model.</p>
+  <p>For <code>23+45=</code>, we use the scores from the <code>=</code> position.
+  If the highest score belongs to token ID 6, the app appends <code>6</code> and
+  runs the model again on <code>23+45=6</code>. Now the final position predicts
+  <code>8</code>, and the following run should predict <code>;</code> to finish.
+  That is the desired behavior after learning; an untrained model will usually
+  choose the wrong characters.</p>
+  <p>For a complementary implementation walkthrough, see
+  <a href="https://jaykmody.com/blog/gpt-from-scratch/">Jay Mody's GPT in 60 Lines
+  of NumPy</a>. The dimensions and ReLU above describe this app's own small model.</p>
 
   <h2>4 · The loss — grade only the answer</h2>
   <p>Softmax turns logits into a probability distribution, and we penalize the negative
